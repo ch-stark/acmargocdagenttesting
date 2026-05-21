@@ -330,6 +330,105 @@ What it does NOT affect:
 
 ---
 
+#### TC-SYNC-07: No-Delete GitOps with ApplicationSet in Any Namespace
+
+ApplicationSets introduce a **second deletion vector** beyond `prune`. When a cluster is removed from the Placement/generator, the ApplicationSet controller deletes the generated `Application`, which by default **cascade-deletes all its managed resources** on the spoke. `prune: false` in the template does NOT prevent this — it only controls what happens when a resource is removed from Git, not when the entire Application is removed by the ApplicationSet controller.
+
+To achieve full "no delete" with ApplicationSets, you need both:
+
+| Layer | Config | What it prevents |
+|-------|--------|-----------------|
+| **ApplicationSet `syncPolicy`** | `preserveResourcesOnDeletion: true` | Prevents cascade deletion of spoke resources when a generated Application is removed (e.g., cluster removed from Placement) |
+| **Template `syncPolicy`** | `automated.prune: false` | Prevents deletion of individual resources when they are removed from the Git source |
+
+> **Without `preserveResourcesOnDeletion: true`:** if a managed cluster is removed from the Placement, the ApplicationSet deletes the generated Application, which deletes all resources on that cluster — even though `prune: false` is set. This is because the Application itself is being deleted, not just a resource within it.
+
+| Field | Value |
+|-------|-------|
+| **Objective** | Verify that an ApplicationSet deploying to any namespace across multiple managed clusters preserves all spoke resources when: (a) a resource is removed from Git, and (b) a cluster is removed from the Placement |
+| **Pre-condition** | Agent mode enabled; hub principal with `allowedNamespaces: ["*"]`; Placement selecting 2+ managed clusters; custom AppProject allowing multiple destination namespaces |
+| **Steps** | 1. Create AppProject `appset-no-delete` allowing destinations `namespace: "*"` with `orphanedResources.warn: true`<br>2. Apply ApplicationSet with `preserveResourcesOnDeletion: true` and template `syncPolicy.automated.prune: false, selfHeal: true`<br>3. Use `clusterDecisionResource` generator referencing `acm-placement`<br>4. Template deploys to namespace `app-{{name}}` (dynamic per cluster) with `CreateNamespace=true`<br>5. Wait for generated Applications to sync on all matched clusters<br>6. Verify workloads running in `app-<cluster>` namespace on each managed cluster<br>7. **Test no-delete (Git removal):** Remove a `ConfigMap` from the Git source — verify it is NOT deleted on any managed cluster<br>8. **Test no-delete (cluster removal):** Remove one cluster from the Placement label selector — verify the generated Application is deleted from hub, but **all resources remain on the spoke cluster**<br>9. **Test re-add:** Add the cluster back to the Placement — verify ApplicationSet regenerates the Application and it syncs without duplicating existing resources<br>10. Verify hub accurately mirrors all states throughout |
+| **Expected** | Resources survive both Git-level removal (prune: false) and ApplicationSet-level Application removal (preserveResourcesOnDeletion: true); re-adding the cluster reconciles cleanly |
+| **Result** | **NOT YET TESTED** |
+
+```yaml
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: appset-no-delete
+  namespace: openshift-gitops
+spec:
+  sourceRepos:
+    - "https://github.com/argoproj/argocd-example-apps"
+  destinations:
+    - namespace: "*"
+      server: "*"
+  clusterResourceWhitelist: []
+  namespaceResourceWhitelist:
+    - group: ""
+      kind: "*"
+    - group: "apps"
+      kind: "*"
+  orphanedResources:
+    warn: true
+---
+apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
+metadata:
+  name: guestbook-no-delete
+  namespace: openshift-gitops
+spec:
+  generators:
+    - clusterDecisionResource:
+        configMapRef: acm-placement
+        labelSelector:
+          matchLabels:
+            cluster.open-cluster-management.io/placement: agent-placement
+        requeueAfterSeconds: 180
+  syncPolicy:
+    preserveResourcesOnDeletion: true    # <-- prevents cascade delete on Application removal
+  template:
+    metadata:
+      name: 'guestbook-{{name}}'
+    spec:
+      project: appset-no-delete
+      source:
+        repoURL: https://github.com/argoproj/argocd-example-apps
+        targetRevision: HEAD
+        path: guestbook
+      destination:
+        name: '{{name}}'
+        namespace: 'app-{{name}}'        # <-- dynamic namespace per cluster
+      syncPolicy:
+        automated:
+          prune: false                    # <-- never auto-delete resources from Git removal
+          selfHeal: true
+        syncOptions:
+          - CreateNamespace=true          # <-- auto-create target namespace
+```
+
+**Full "no delete" configuration with ApplicationSets — reference:**
+
+```
+Where to set it:
+├── ApplicationSet.spec.syncPolicy.preserveResourcesOnDeletion: true   ← REQUIRED
+│   └── Prevents: cluster removed from Placement → Application deleted → resources deleted
+├── Template.spec.syncPolicy.automated.prune: false                     ← REQUIRED
+│   └── Prevents: resource removed from Git → resource deleted on spoke
+├── Resource annotation: Prune=false                                    ← RECOMMENDED
+│   └── Prevents: manual argocd app sync --prune from deleting critical resources
+└── AppProject.spec.orphanedResources.warn: true                        ← OPTIONAL
+    └── Provides: visibility into resources that exist on cluster but not in Git
+
+Two deletion vectors in ApplicationSets:
+1. Git-level removal  → controlled by prune: false (template syncPolicy)
+2. Application removal → controlled by preserveResourcesOnDeletion: true (ApplicationSet syncPolicy)
+
+Both must be set — they are independent controls.
+```
+
+---
+
 ### 2.3 — Principal `allowedNamespaces` Restriction Test
 
 #### TC-PRINCIPAL-01: Hub Principal with Restricted `allowedNamespaces`
@@ -372,6 +471,7 @@ Lower priority. Most setups with cluster-admin RBAC rely on AppProject as the gu
 |----------|---------|-----------|
 | **P0 — Must have** | TC-PROJECT-04 | Multi-tenant isolation through the agent — highest risk for cross-project breach |
 | **P0 — Must have** | TC-PROJECT-01 | sourceRepos restriction — fundamental AppProject guardrail, enforcement boundary unclear in agent model |
+| **P0 — Must have** | TC-SYNC-07 | No-delete with ApplicationSet in any namespace — covers both deletion vectors (Git removal + Application removal via Placement) |
 | **P0 — Must have** | TC-SYNC-06 | Full "no delete via Git" test — combines `prune: false`, per-resource annotation, and AppProject `orphanedResources` |
 | **P0 — Must have** | TC-SYNC-01 | `prune: false` is the most common production pattern for safe GitOps |
 | **P1 — Should have** | TC-PROJECT-02 | Blocking Secrets via Git is a common security policy; validates partial sync failure handling |
