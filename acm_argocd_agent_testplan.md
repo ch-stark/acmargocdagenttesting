@@ -217,6 +217,26 @@ spec:
 
 ---
 
+### 3.5 — ApplicationSets in Any Namespace (Optional / Tech Preview)
+
+> **Status:** Tech Preview — confirmed working with the Agent in managed mode.
+>
+> **Future:** In Argo CD 1.20, routing applications to clusters will be based on `spec.destination`, making ApplicationSets in Any Namespace no longer required with the Agent. Plan to revisit this section once 1.20 ships.
+
+#### TC-APPSET-NS-01: ApplicationSet in Non-Default Namespace with Agent Managed Mode (Optional)
+
+| Field | Value |
+|-------|-------|
+| **Objective** | Verify an `ApplicationSet` created outside `openshift-gitops` (i.e., in an arbitrary namespace) is picked up by the agent and generates Applications on managed clusters |
+| **Pre-condition** | Agent mode enabled; `sourceNamespaces: ["*"]` configured on hub principal; ApplicationSets in Any Namespace feature enabled (tech preview) |
+| **Steps** | 1. Create a namespace (e.g., `team-a-gitops`) on the hub<br>2. Configure `sourceNamespaces` on the ArgoCD instance to include `team-a-gitops` (or `["*"]`)<br>3. Create an `ApplicationSet` in `team-a-gitops` using `clusterDecisionResource` generator<br>4. Verify Application instances are generated per managed cluster<br>5. Verify workloads deploy on managed clusters<br>6. Verify hub shows generated applications with correct status |
+| **Expected** | ApplicationSet in non-default namespace generates Applications; agent pulls specs to managed clusters; workloads deploy successfully |
+| **Result** | **PASSED** |
+| **Evidence** | ApplicationSet in `team-a-gitops` namespace generated applications; workloads confirmed on managed clusters |
+| **Note** | This is a **tech preview** feature. In Argo CD 1.20, `spec.destination`-based routing will eliminate the need for ApplicationSets in Any Namespace when using the Agent. |
+
+---
+
 ## 4. Prior Validation Matrix (from PDF Report)
 
 The following results are carried forward from the [formal validation report](https://github.com/ch-stark/acmargocdagenttesting/blob/main/argocd_agent_test_report.pdf) (8/8 scenarios passed, 2 target environments, 100% manifest compliance):
@@ -269,11 +289,12 @@ Since automation does not fully support non-OCP clusters, the following are test
 | Standalone ArgoCD (TC-STANDALONE) | 1 | 1 | 0 | 0 |
 | Basic Pull Model (TC-PULL) | 3 | 3 | 0 | 0 |
 | Advanced Agent Pull Model (TC-AGENT) | 1 | 1 | 0 | 0 |
+| AppSets in Any Namespace (TC-APPSET-NS) *(optional/tech preview)* | 1 | 1 | 0 | 0 |
 | Local-Cluster Support (TC-LOCAL) | 1 | 1 | 0 | 0 |
 | Prior Validation Matrix (TC-01..08) | 8 | 7 | 1 | 0 |
-| **Total** | **16** | **15** | **1** | **0** |
+| **Total** | **17** | **16** | **1** | **0** |
 
-**Overall Status: ALL TESTS PASSING** (TC-04 expected failure by design — SCC restricted-v2 boundary enforcement)
+**Overall Status: ALL TESTS PASSING** (TC-04 expected failure by design — SCC restricted-v2 boundary enforcement; TC-APPSET-NS-01 is optional/tech preview)
 
 ---
 
