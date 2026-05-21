@@ -147,7 +147,190 @@ spec:
 
 ---
 
-### 2.2 — Sync Policy / Prune Protection Tests
+### 2.2 — ApplicationSet Generator & Resilience Tests
+
+The current test plan only covers `clusterDecisionResource` generator (TC-AGENT-01, TC-SYNC-07). The following generators and resilience scenarios are untested.
+
+#### TC-APPSET-01: GitGenerator — Directory-Based ApplicationSet via Agent
+
+| Field | Value |
+|-------|-------|
+| **Objective** | Verify an ApplicationSet using `git.directories` generator creates one Application per directory in a Git repo, synced to managed clusters via the agent pull model |
+| **Pre-condition** | Agent mode enabled; Git repo with multiple app directories (e.g., `apps/app-a/`, `apps/app-b/`, `apps/app-c/`) |
+| **Steps** | 1. Create ApplicationSet with `git` generator scanning directories under `apps/`<br>2. Set destination to a specific managed cluster via `destination.name`<br>3. Verify one Application is generated per directory<br>4. Verify each Application syncs and deploys its workload on the managed cluster<br>5. **Test add:** Add a new directory `apps/app-d/` to Git — verify a new Application is auto-generated and synced<br>6. **Test remove:** Remove directory `apps/app-c/` from Git — verify the Application is removed (or preserved per `preserveResourcesOnDeletion`)<br>7. Verify hub mirrors all generated Applications and their statuses |
+| **Expected** | One Application per Git directory; dynamic addition/removal works through the agent |
+| **Result** | **NOT YET TESTED** |
+
+```yaml
+apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
+metadata:
+  name: git-directory-apps
+  namespace: openshift-gitops
+spec:
+  generators:
+    - git:
+        repoURL: https://github.com/argoproj/argocd-example-apps
+        revision: HEAD
+        directories:
+          - path: "apps/*"
+  template:
+    metadata:
+      name: '{{path.basename}}'
+    spec:
+      project: default
+      source:
+        repoURL: https://github.com/argoproj/argocd-example-apps
+        targetRevision: HEAD
+        path: '{{path}}'
+      destination:
+        name: ocp-cluster1
+        namespace: '{{path.basename}}'
+      syncPolicy:
+        automated:
+          prune: false
+          selfHeal: true
+        syncOptions:
+          - CreateNamespace=true
+```
+
+---
+
+#### TC-APPSET-02: GitGenerator — File-Based ApplicationSet via Agent
+
+| Field | Value |
+|-------|-------|
+| **Objective** | Verify an ApplicationSet using `git.files` generator reads JSON/YAML config files from Git to parameterize Applications deployed through the agent |
+| **Pre-condition** | Agent mode enabled; Git repo with config files (e.g., `config/cluster-a.json`, `config/cluster-b.json`) containing per-cluster parameters |
+| **Steps** | 1. Create config files in Git with per-cluster parameters (namespace, replicas, etc.)<br>2. Create ApplicationSet with `git.files` generator pointing to `config/*.json`<br>3. Verify Applications are generated with correct per-cluster parameters<br>4. Verify workloads deploy with the specified parameters on managed clusters<br>5. **Test update:** Modify a config file (e.g., change replicas) — verify the Application and workload update accordingly<br>6. Verify hub reflects all generated Applications |
+| **Expected** | Applications parameterized from Git config files; updates to config files propagate through the agent |
+| **Result** | **NOT YET TESTED** |
+
+```yaml
+apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
+metadata:
+  name: git-file-apps
+  namespace: openshift-gitops
+spec:
+  generators:
+    - git:
+        repoURL: https://github.com/your-org/gitops-config
+        revision: HEAD
+        files:
+          - path: "config/*.json"
+  template:
+    metadata:
+      name: 'app-{{cluster.name}}'
+    spec:
+      project: default
+      source:
+        repoURL: https://github.com/argoproj/argocd-example-apps
+        targetRevision: HEAD
+        path: guestbook
+      destination:
+        name: '{{cluster.name}}'
+        namespace: '{{app.namespace}}'
+      syncPolicy:
+        automated:
+          prune: false
+          selfHeal: true
+```
+
+---
+
+#### TC-APPSET-03: MatrixGenerator — ClusterDecision + GitGenerator Combined
+
+| Field | Value |
+|-------|-------|
+| **Objective** | Verify a Matrix generator combining `clusterDecisionResource` (which clusters) with `git.directories` (which apps) produces the correct cross-product of Applications through the agent |
+| **Pre-condition** | Agent mode enabled; Placement selecting 2+ clusters; Git repo with 2+ app directories |
+| **Steps** | 1. Create ApplicationSet with `matrix` generator combining `clusterDecisionResource` and `git.directories`<br>2. Placement selects clusters `cluster-a` and `cluster-b`; Git has directories `apps/frontend/` and `apps/backend/`<br>3. Verify 4 Applications are generated (2 clusters x 2 apps): `frontend-cluster-a`, `frontend-cluster-b`, `backend-cluster-a`, `backend-cluster-b`<br>4. Verify all 4 sync and deploy correct workloads to the correct clusters and namespaces<br>5. **Test add cluster:** Add `cluster-c` to Placement — verify 2 new Applications generated (`frontend-cluster-c`, `backend-cluster-c`)<br>6. **Test add app:** Add `apps/api/` to Git — verify 3 new Applications generated (one per cluster)<br>7. **Test remove cluster:** Remove `cluster-b` from Placement — verify 2 Applications removed (or resources preserved per `preserveResourcesOnDeletion`)<br>8. Verify hub mirrors the full matrix of Applications and their statuses |
+| **Expected** | Cross-product of clusters x apps; dynamic addition/removal of clusters and apps updates the matrix correctly |
+| **Result** | **NOT YET TESTED** |
+
+```yaml
+apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
+metadata:
+  name: matrix-cluster-apps
+  namespace: openshift-gitops
+spec:
+  generators:
+    - matrix:
+        generators:
+          - clusterDecisionResource:
+              configMapRef: acm-placement
+              labelSelector:
+                matchLabels:
+                  cluster.open-cluster-management.io/placement: agent-placement
+              requeueAfterSeconds: 180
+          - git:
+              repoURL: https://github.com/argoproj/argocd-example-apps
+              revision: HEAD
+              directories:
+                - path: "apps/*"
+  syncPolicy:
+    preserveResourcesOnDeletion: true
+  template:
+    metadata:
+      name: '{{path.basename}}-{{name}}'
+    spec:
+      project: default
+      source:
+        repoURL: https://github.com/argoproj/argocd-example-apps
+        targetRevision: HEAD
+        path: '{{path}}'
+      destination:
+        name: '{{name}}'
+        namespace: '{{path.basename}}'
+      syncPolicy:
+        automated:
+          prune: false
+          selfHeal: true
+        syncOptions:
+          - CreateNamespace=true
+```
+
+---
+
+#### TC-APPSET-04: Managed Cluster Disconnected — Agent Loses Connection to Principal
+
+| Field | Value |
+|-------|-------|
+| **Objective** | Verify behavior when a managed cluster loses connectivity to the hub (agent cannot reach the principal): workloads continue running, status goes stale on hub, and reconnection re-syncs cleanly |
+| **Pre-condition** | Agent mode enabled; Applications synced and healthy on managed cluster |
+| **Steps** | 1. Verify Application is `Synced`/`Healthy` on both hub and managed cluster<br>2. **Simulate disconnect:** Block network connectivity between the managed cluster and the hub (e.g., firewall rule blocking the principal route, or scale down the cluster-proxy)<br>3. Verify workloads **continue running** on the managed cluster — the agent operates independently<br>4. Verify hub shows Application status becomes stale / unknown / loses heartbeat<br>5. **Test drift during disconnect:** Make a change in Git while disconnected — verify the managed cluster does NOT sync (agent cannot reach principal for new specs)<br>6. **Restore connectivity:** Remove the network block<br>7. Verify agent reconnects to principal via mTLS<br>8. Verify pending Git changes now sync to managed cluster<br>9. Verify hub status updates to reflect current state<br>10. Verify no duplicate resources or conflicts from the reconnection |
+| **Expected** | Workloads survive disconnection; hub status goes stale; reconnection triggers clean re-sync without duplication |
+| **Result** | **NOT YET TESTED** |
+
+---
+
+#### TC-APPSET-05: Managed Cluster Updated (OCP Upgrade) — Agent Continuity
+
+| Field | Value |
+|-------|-------|
+| **Objective** | Verify the agent continues functioning correctly after a managed cluster OCP upgrade, and the agent version drift heal mechanism patches the agent image if needed |
+| **Pre-condition** | Agent mode enabled; Applications synced and healthy; managed cluster on OCP version N |
+| **Steps** | 1. Record current agent pod image version on managed cluster<br>2. Record current principal Deployment image version on hub<br>3. **Upgrade managed cluster** from OCP version N to N+1 (or trigger an OpenShift GitOps operator upgrade on the hub)<br>4. Verify addon pods restart successfully after upgrade<br>5. Verify agent re-establishes mTLS connection to principal<br>6. Verify existing Applications remain `Synced`/`Healthy`<br>7. **Test version drift heal:** If the hub's OpenShift GitOps operator is upgraded (new principal image), verify the hub controller auto-patches the ArgoCD Policy to enforce the updated agent image on managed clusters<br>8. Verify the managed cluster agent pod image is updated to match the principal<br>9. Verify no Application disruption during the agent image rollout<br>10. Verify `apps.open-cluster-management.io/skip-agent-version-heal: "true"` annotation disables the auto-patch when set |
+| **Expected** | Agent survives cluster upgrade; version drift heal patches agent image automatically; Applications remain healthy throughout |
+| **Result** | **NOT YET TESTED** |
+
+---
+
+#### TC-APPSET-06: Managed Cluster Disconnected with ApplicationSet — Resource Preservation
+
+| Field | Value |
+|-------|-------|
+| **Objective** | Verify that when a managed cluster is disconnected AND removed from the Placement, spoke resources are preserved (with `preserveResourcesOnDeletion: true`), and re-adding the cluster after reconnection reconciles cleanly |
+| **Pre-condition** | Agent mode enabled; ApplicationSet with `preserveResourcesOnDeletion: true` and `prune: false`; workloads deployed on managed cluster |
+| **Steps** | 1. Verify ApplicationSet has generated Applications and workloads are running on managed cluster<br>2. **Simulate disconnect:** Block network from managed cluster to hub<br>3. **Remove cluster from Placement** while disconnected (change Placement label selector on hub)<br>4. Verify the generated Application is removed from the hub<br>5. Verify the hub cannot confirm spoke resource state (cluster is disconnected)<br>6. **Restore connectivity:** Remove the network block<br>7. Verify workloads are **still running** on the managed cluster (not deleted — `preserveResourcesOnDeletion` + disconnect means no cascade)<br>8. **Re-add cluster to Placement:** Restore the label selector<br>9. Verify ApplicationSet regenerates the Application<br>10. Verify agent re-syncs — existing resources are adopted, not duplicated<br>11. Verify hub shows `Synced`/`Healthy` again |
+| **Expected** | Resources survive both disconnection and Placement removal; reconnection + re-add results in clean adoption without duplication |
+| **Result** | **NOT YET TESTED** |
+
+---
+
+### 2.3 — Sync Policy / Prune Protection Tests
 
 #### TC-SYNC-01: Create and Update Only — `prune: false`
 
@@ -471,6 +654,8 @@ Lower priority. Most setups with cluster-admin RBAC rely on AppProject as the gu
 |----------|---------|-----------|
 | **P0 — Must have** | TC-PROJECT-04 | Multi-tenant isolation through the agent — highest risk for cross-project breach |
 | **P0 — Must have** | TC-PROJECT-01 | sourceRepos restriction — fundamental AppProject guardrail, enforcement boundary unclear in agent model |
+| **P0 — Must have** | TC-APPSET-03 | MatrixGenerator (ClusterDecision + Git) — the primary multi-cluster + multi-app pattern for agent pull model |
+| **P0 — Must have** | TC-APPSET-04 | Cluster disconnected — agent resilience, workload survival, reconnection re-sync |
 | **P0 — Must have** | TC-SYNC-07 | No-delete with ApplicationSet in any namespace — covers both deletion vectors (Git removal + Application removal via Placement) |
 | **P0 — Must have** | TC-SYNC-06 | Full "no delete via Git" test — combines `prune: false`, per-resource annotation, and AppProject `orphanedResources` |
 | **P0 — Must have** | TC-SYNC-01 | `prune: false` is the most common production pattern for safe GitOps |
@@ -478,6 +663,10 @@ Lower priority. Most setups with cluster-admin RBAC rely on AppProject as the gu
 | **P1 — Should have** | TC-SYNC-04 | selfHeal: false is critical for teams that make manual cluster-side changes |
 | **P1 — Should have** | TC-SYNC-03 | Per-resource prune protection is a widely-used safety mechanism |
 | **P2 — Nice to have** | TC-PROJECT-03 | clusterResourceWhitelist enforcement — AppProject as guardrail for cluster-scoped resources |
+| **P1 — Should have** | TC-APPSET-01 | GitGenerator (directories) — common pattern for mono-repo GitOps |
+| **P1 — Should have** | TC-APPSET-06 | Cluster disconnected + removed from Placement — worst-case resilience scenario |
+| **P1 — Should have** | TC-APPSET-05 | Cluster OCP upgrade — agent continuity and version drift heal |
+| **P2 — Nice to have** | TC-APPSET-02 | GitGenerator (files) — parameterized per-cluster config from Git |
 | **P2 — Nice to have** | TC-SYNC-02 | Manual-only sync |
 | **P2 — Nice to have** | TC-SYNC-05 | CreateNamespace sync option |
 | **P2 — Nice to have** | TC-PRINCIPAL-01 | Principal namespace restriction |
