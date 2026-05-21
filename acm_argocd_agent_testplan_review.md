@@ -7,31 +7,7 @@
 
 ## 1. Critical Findings
 
-### 1.1 — RBAC: Every Test Uses `cluster-admin`
-
-The companion policy in the current test plan (and the PDF report) binds the ArgoCD application controller ServiceAccount to `cluster-admin`:
-
-```yaml
-roleRef:
-  kind: ClusterRole
-  name: cluster-admin    # <-- this is what every test relies on
-subjects:
-  - kind: ServiceAccount
-    name: acm-openshift-gitops-argocd-application-controller
-    namespace: openshift-gitops
-```
-
-**What's missing:**
-- No test with a **namespace-scoped Role** instead of a ClusterRole — what happens when the agent SA can only deploy into specific namespaces?
-- No test with a **least-privilege ClusterRole** (e.g., only `create`, `get`, `list`, `update`, `patch` on specific resource kinds, no `delete`)
-- No **negative test** verifying that the agent correctly fails when RBAC denies an operation (e.g., trying to create a `ClusterRole` when only namespace resources are permitted)
-- No test for RBAC differences between the agent SA and the application controller SA — these are distinct principals in the agent model
-
-**Risk:** Every customer deployment guide says "don't use cluster-admin in production." If we only test with cluster-admin, we have zero confidence that least-privilege setups work.
-
----
-
-### 1.2 — Default `AppProject` Used Almost Everywhere
+### 1.1 — Default `AppProject` Used Almost Everywhere
 
 TC-PULL-01, TC-PULL-02, TC-AGENT-01, and TC-STANDALONE-01 all use `project: default`. The `default` AppProject permits:
 - All source repos (`*`)
@@ -48,7 +24,7 @@ TC-PULL-03 claims to test a custom AppProject but lacks:
 
 ---
 
-### 1.3 — All Sync Policies Use `prune: true` — No Create/Update-Only Scenario
+### 1.2 — All Sync Policies Use `prune: true` — No Create/Update-Only Scenario
 
 Every single test case sets:
 ```yaml
@@ -69,7 +45,7 @@ syncPolicy:
 
 ---
 
-### 1.4 — Other Gaps
+### 1.3 — Other Gaps
 
 | Gap | Impact |
 |-----|--------|
@@ -83,83 +59,7 @@ syncPolicy:
 
 ## 2. Additional Test Cases
 
-### 2.1 — RBAC Tests
-
-#### TC-RBAC-01: Least-Privilege Namespace-Scoped RBAC
-
-| Field | Value |
-|-------|-------|
-| **Objective** | Verify agent pull model works when the application controller SA has only a namespace-scoped `Role` (not `ClusterRole`) limited to a single target namespace |
-| **Pre-condition** | Agent mode enabled; companion policy deploys a `Role` + `RoleBinding` in `guestbook` namespace only (not a `ClusterRoleBinding`) |
-| **Steps** | 1. Create companion policy that provisions a `Role` in `guestbook` namespace with verbs: `get`, `list`, `create`, `update`, `patch` on `deployments`, `services`, `pods`<br>2. Bind the role to the argocd application controller SA<br>3. Create `Application` on hub targeting `guestbook` namespace<br>4. Verify application syncs and workload deploys<br>5. Verify the agent does NOT have permissions outside `guestbook` namespace |
-| **Expected** | Application syncs successfully within the permitted namespace; operations outside it are denied |
-| **Result** | **NOT YET TESTED** |
-
-```yaml
-apiVersion: rbac.authorization.k8s.io/v1
-kind: Role
-metadata:
-  name: gitops-guestbook-deployer
-  namespace: guestbook
-rules:
-  - apiGroups: ["", "apps"]
-    resources: ["deployments", "services", "pods", "configmaps"]
-    verbs: ["get", "list", "watch", "create", "update", "patch"]
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: RoleBinding
-metadata:
-  name: gitops-guestbook-deployer-binding
-  namespace: guestbook
-roleRef:
-  apiGroup: rbac.authorization.k8s.io
-  kind: Role
-  name: gitops-guestbook-deployer
-subjects:
-  - kind: ServiceAccount
-    name: acm-openshift-gitops-argocd-application-controller
-    namespace: openshift-gitops
-```
-
----
-
-#### TC-RBAC-02: RBAC Denies Cluster-Scoped Resource Creation
-
-| Field | Value |
-|-------|-------|
-| **Objective** | Verify that an Application attempting to create cluster-scoped resources (e.g., `ClusterRole`, `Namespace`) fails gracefully when RBAC only grants namespace-scoped permissions |
-| **Pre-condition** | Agent mode enabled; application controller SA has only namespace-scoped `Role` (no `ClusterRole`) |
-| **Steps** | 1. Use the namespace-scoped Role from TC-RBAC-01<br>2. Create an Application whose Git source includes a `ClusterRole` and a `Namespace` resource<br>3. Observe sync behavior<br>4. Verify Application enters `Degraded` or `SyncFailed` status on the managed cluster<br>5. Verify hub reflects the failure status accurately |
-| **Expected** | Sync fails for cluster-scoped resources with RBAC denial error; namespace-scoped resources in the same app may partially sync or the entire sync fails (document actual behavior); hub mirrors the error state |
-| **Result** | **NOT YET TESTED** |
-
----
-
-#### TC-RBAC-03: RBAC Without Delete Permissions
-
-| Field | Value |
-|-------|-------|
-| **Objective** | Verify that even with `prune: true`, the agent cannot delete resources when the SA lacks `delete` verb in RBAC |
-| **Pre-condition** | Agent mode enabled; companion policy grants `get`, `list`, `create`, `update`, `patch` but NOT `delete` |
-| **Steps** | 1. Deploy Application with `prune: true` and `selfHeal: true`<br>2. Wait for initial sync to complete<br>3. Remove a resource from the Git source<br>4. Wait for ArgoCD to detect the drift and attempt pruning<br>5. Verify prune fails with RBAC denial<br>6. Verify the resource remains on the managed cluster<br>7. Verify hub shows the prune failure status |
-| **Expected** | Resource is NOT deleted; Application shows `OutOfSync` with prune error; RBAC denial logged |
-| **Result** | **NOT YET TESTED** |
-
----
-
-#### TC-RBAC-04: Least-Privilege ClusterRole (No Wildcard)
-
-| Field | Value |
-|-------|-------|
-| **Objective** | Verify agent works with a `ClusterRole` that explicitly lists allowed API groups, resources, and verbs instead of using wildcards |
-| **Pre-condition** | Agent mode enabled |
-| **Steps** | 1. Create a `ClusterRole` that permits only: `apps/deployments`, `core/services`, `core/configmaps`, `core/namespaces` with verbs `get`, `list`, `watch`, `create`, `update`, `patch`<br>2. Bind to application controller SA via `ClusterRoleBinding`<br>3. Deploy Application that uses only these resource types<br>4. Verify sync succeeds<br>5. Deploy a second Application that attempts to create a `Secret` (not in the allowed list)<br>6. Verify the second application fails |
-| **Expected** | First application syncs; second application fails with Forbidden error |
-| **Result** | **NOT YET TESTED** |
-
----
-
-### 2.2 — AppProject Enforcement Tests
+### 2.1 — AppProject Enforcement Tests
 
 #### TC-PROJECT-01: AppProject with Restricted `sourceRepos`
 
@@ -247,7 +147,7 @@ spec:
 
 ---
 
-### 2.3 — Sync Policy / Prune Protection Tests
+### 2.2 — Sync Policy / Prune Protection Tests
 
 #### TC-SYNC-01: Create and Update Only — `prune: false`
 
@@ -337,7 +237,7 @@ syncPolicy:
 
 ---
 
-### 2.4 — Principal `allowedNamespaces` Restriction Test
+### 2.3 — Principal `allowedNamespaces` Restriction Test
 
 #### TC-PRINCIPAL-01: Hub Principal with Restricted `allowedNamespaces`
 
@@ -356,14 +256,10 @@ syncPolicy:
 | Priority | Test ID | Rationale |
 |----------|---------|-----------|
 | **P0 — Must have** | TC-SYNC-01 | `prune: false` is the most common production pattern for safe GitOps |
-| **P0 — Must have** | TC-RBAC-01 | Least-privilege RBAC is a security requirement for every production deployment |
 | **P0 — Must have** | TC-PROJECT-01 | sourceRepos restriction is a baseline AppProject use case |
-| **P1 — Should have** | TC-RBAC-03 | RBAC without delete verbs is the server-side enforcement of "no deletion via Git" |
 | **P1 — Should have** | TC-SYNC-04 | selfHeal: false is critical for teams that make manual cluster-side changes |
 | **P1 — Should have** | TC-PROJECT-02 | Blocking Secrets via Git is a common security policy |
 | **P1 — Should have** | TC-SYNC-03 | Per-resource prune protection is a widely-used safety mechanism |
-| **P2 — Nice to have** | TC-RBAC-02 | Negative test for cluster-scoped resource denial |
-| **P2 — Nice to have** | TC-RBAC-04 | Non-wildcard ClusterRole validation |
 | **P2 — Nice to have** | TC-PROJECT-03 | clusterResourceWhitelist enforcement |
 | **P2 — Nice to have** | TC-PROJECT-04 | Multi-project isolation |
 | **P2 — Nice to have** | TC-SYNC-02 | Manual-only sync |
@@ -374,16 +270,15 @@ syncPolicy:
 
 ## 4. Summary
 
-The current test plan validates the **happy path with maximum permissions**. It proves the agent pull model works when:
-- RBAC is `cluster-admin`
+The current test plan validates the **happy path with wide-open AppProject and aggressive sync policies**. It proves the agent pull model works when:
+- RBAC is `cluster-admin` (correct — companion policy always runs as cluster-admin)
 - AppProject is `default` (allow everything)
 - Sync policy is `automated + prune + selfHeal`
 
-It does **not** validate any of the configurations real production users will run:
-- Least-privilege RBAC (namespace-scoped or resource-restricted)
+It does **not** validate configurations that production users commonly need:
 - Custom AppProjects restricting repos, namespaces, or resource kinds
 - `prune: false` (create/update only, never delete)
 - `selfHeal: false` (allow manual cluster changes)
 - Per-resource sync option overrides
 
-**Recommendation:** Prioritize TC-SYNC-01, TC-RBAC-01, and TC-PROJECT-01 as immediate additions — they represent the most common production divergence from the current test matrix.
+**Recommendation:** Prioritize TC-SYNC-01 and TC-PROJECT-01 as immediate additions — they represent the most common production divergence from the current test matrix.
