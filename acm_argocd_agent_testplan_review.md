@@ -251,17 +251,39 @@ syncPolicy:
 
 ---
 
-## 3. Proposed Test Priority
+## 3. AppProject Test Recommendations
+
+The agent pull model introduces a unique enforcement boundary: AppProject definitions live on the hub (principal side), but reconciliation happens on the spoke (agent side). This makes AppProject enforcement through the agent a higher-risk area than in standard ArgoCD — a bug could mean the principal accepts an Application that the agent enforces differently, or vice versa. The following recommendations are ordered by risk to production users.
+
+### P0 — Multi-Tenant Isolation (TC-PROJECT-04)
+
+**Start here.** This is the most critical AppProject test for the agent model. When two teams share a managed cluster with different AppProjects (`team-a` scoped to `team-a-ns`, `team-b` scoped to `team-b-ns`), project isolation must hold through the entire hub-to-spoke flow. If `team-a` can accidentally or intentionally deploy into `team-b-ns`, that is a multi-tenancy breach. This scenario is also the most likely to surface agent-specific bugs because both the principal and the agent need to enforce the boundary consistently — a mismatch between the two could allow cross-project resource access that would never occur in a single-cluster ArgoCD setup.
+
+### P0 — Restricted `sourceRepos` (TC-PROJECT-01)
+
+The second priority. `sourceRepos` is the most fundamental AppProject restriction — it controls which Git repositories can supply manifests. In the agent model, the key question is: does the principal reject the Application before it reaches the agent, or does the agent enforce it locally? Either way the sync should be blocked, but knowing *where* the enforcement happens matters for security posture. If enforcement only happens agent-side, a compromised or misconfigured agent could bypass it entirely, allowing manifests from unauthorized repositories.
+
+### P1 — Deny Secrets via `namespaceResourceBlacklist` (TC-PROJECT-02)
+
+This is the most common real-world AppProject restriction. Teams want Deployments, Services, and ConfigMaps managed via Git, but Secrets managed via Vault, External Secrets Operator, or sealed-secrets — never stored in Git. If the agent does not respect `namespaceResourceBlacklist`, secrets leak into Git workflows. This also validates that the agent correctly handles partial sync failures (Deployment succeeds, Secret is denied).
+
+### P2 — Empty `clusterResourceWhitelist` (TC-PROJECT-03)
+
+Lower priority. Most setups with cluster-admin RBAC rely on AppProject as the guardrail against cluster-scoped resource creation (Namespaces, ClusterRoles, ClusterRoleBindings). Since the companion policy correctly runs as cluster-admin, the AppProject is the only layer preventing Git-driven creation of cluster-scoped resources. Worth testing but less urgent than the multi-tenancy and sourceRepos scenarios, because accidental cluster-scoped resource creation is typically caught during code review of the Git repo.
+
+---
+
+## 4. Proposed Test Priority (Full Matrix)
 
 | Priority | Test ID | Rationale |
 |----------|---------|-----------|
+| **P0 — Must have** | TC-PROJECT-04 | Multi-tenant isolation through the agent — highest risk for cross-project breach |
+| **P0 — Must have** | TC-PROJECT-01 | sourceRepos restriction — fundamental AppProject guardrail, enforcement boundary unclear in agent model |
 | **P0 — Must have** | TC-SYNC-01 | `prune: false` is the most common production pattern for safe GitOps |
-| **P0 — Must have** | TC-PROJECT-01 | sourceRepos restriction is a baseline AppProject use case |
+| **P1 — Should have** | TC-PROJECT-02 | Blocking Secrets via Git is a common security policy; validates partial sync failure handling |
 | **P1 — Should have** | TC-SYNC-04 | selfHeal: false is critical for teams that make manual cluster-side changes |
-| **P1 — Should have** | TC-PROJECT-02 | Blocking Secrets via Git is a common security policy |
 | **P1 — Should have** | TC-SYNC-03 | Per-resource prune protection is a widely-used safety mechanism |
-| **P2 — Nice to have** | TC-PROJECT-03 | clusterResourceWhitelist enforcement |
-| **P2 — Nice to have** | TC-PROJECT-04 | Multi-project isolation |
+| **P2 — Nice to have** | TC-PROJECT-03 | clusterResourceWhitelist enforcement — AppProject as guardrail for cluster-scoped resources |
 | **P2 — Nice to have** | TC-SYNC-02 | Manual-only sync |
 | **P2 — Nice to have** | TC-SYNC-05 | CreateNamespace sync option |
 | **P2 — Nice to have** | TC-PRINCIPAL-01 | Principal namespace restriction |
@@ -281,4 +303,4 @@ It does **not** validate configurations that production users commonly need:
 - `selfHeal: false` (allow manual cluster changes)
 - Per-resource sync option overrides
 
-**Recommendation:** Prioritize TC-SYNC-01 and TC-PROJECT-01 as immediate additions — they represent the most common production divergence from the current test matrix.
+**Recommendation:** Prioritize TC-PROJECT-04 (multi-tenant isolation), TC-PROJECT-01 (sourceRepos), and TC-SYNC-01 (prune: false) as immediate additions. TC-PROJECT-04 and TC-PROJECT-01 target the agent-specific enforcement boundary where hub principal and spoke agent must agree — the highest-risk area unique to the pull model. TC-SYNC-01 covers the most common production sync policy divergence.
