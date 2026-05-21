@@ -45,7 +45,47 @@ syncPolicy:
 
 ---
 
-### 1.3 — Other Gaps
+### 1.3 — Policy Configuration Not Tested Beyond the Default
+
+Based on the [multicloud-integrations source](https://github.com/stolostron/multicloud-integrations), the ArgoCD Policy is **user-owned** and configurable. The GitOpsCluster controller auto-generates a bare-minimum Policy containing only the ArgoCD CR — users are expected to customize it by adding RBAC, namespaces, Applications, and ArgoCD settings. The controller preserves user customizations and only touches `argoCDAgent.agent.image` during drift heal.
+
+**Current test plan gap:** Every test case assumes a single Policy modification pattern (add `cluster-admin` ClusterRoleBinding + guestbook namespace). No test validates:
+
+- **Policy customization survival** — does the controller actually preserve user-added templates after a reconcile loop?
+- **Policy recreation behavior** — what happens when the Policy is deleted? (Controller recreates unless `skip-argocd-policy` annotation is set)
+- **`skip-argocd-policy` annotation** — verified by e2e but not in our integration test plan
+- **Agent mode Policy differences** — in agent mode, Applications are NOT added to the Policy (they're dispatched by the principal); in autonomous mode, the `default` AppProject IS auto-included
+- **Adding `view` ClusterRoleBinding** for the agent SA to the Policy — required for ArgoCD UI live manifest but never tested
+- **`destinationBasedMapping` consistency** — principal and agent must match or Redis keys diverge and UI breaks
+
+**Key design principle from the source code:**
+
+| Policy aspect | Controller behavior | User responsibility |
+|--------------|-------------------|-------------------|
+| ArgoCD CR | Auto-generated | Can customize ArgoCD settings in the template |
+| RBAC (ClusterRoleBinding) | **Not included** | Must add `cluster-admin` (or custom) binding |
+| Namespaces | **Not included** | Must add target namespaces (or use `CreateNamespace=true`) |
+| Applications (non-agent) | **Not included** | Can add directly to Policy |
+| Applications (agent mode) | **Not in Policy** | Created on hub, dispatched by principal |
+| `default` AppProject (autonomous) | Auto-included | N/A — controller adds it automatically |
+| `argoCDAgent.agent.image` | Patched during drift heal | Can disable via `skip-agent-version-heal` annotation |
+| All other customizations | **Preserved across reconciles** | User owns and maintains |
+
+**Critical prerequisites NOT in the Policy that are easy to miss:**
+
+| Prerequisite | Where to configure | What breaks without it |
+|-------------|-------------------|----------------------|
+| `ManagedClusterSetBinding` for `default` in `openshift-gitops` | Hub, manually | Placement finds zero clusters |
+| `default` AppProject wildcards (`sourceNamespaces: ["*"]`, `destinations: [{name:"*", namespace:"*", server:"*"}]`, `clusterResourceWhitelist: [{group:"*", kind:"*"}]`, `sourceRepos: ["*"]`) | Hub ArgoCD, manually | Principal skips AppProject propagation; agents fail with "project not found" |
+| `ARGOCD_CLUSTER_CONFIG_NAMESPACES=openshift-gitops,local-cluster` | OLM Subscription env var | Agent/principal pods crash with "namespaces is forbidden" |
+| `view` ClusterRoleBinding for agent SA (`acm-openshift-gitops-agent-agent`) | Managed cluster, manually or via Policy | ArgoCD UI live manifest returns "Resource not found in cluster" |
+| `destinationBasedMapping: true` on agent ArgoCD CR | Policy object template | Redis key mismatch between principal/agent; UI live manifest breaks |
+
+**Risk:** Users who follow the documentation step-by-step will miss these prerequisites because they're scattered across different configuration layers. The test plan should validate that missing any single prerequisite produces a clear error, not a silent failure.
+
+---
+
+### 1.4 — Other Gaps
 
 | Gap | Impact |
 |-----|--------|
@@ -54,6 +94,8 @@ syncPolicy:
 | **No network disruption / reconnection test** — what happens when the agent loses mTLS connection to the principal and reconnects? | Resilience unknown |
 | **No multi-AppProject test** — what if two Applications in different AppProjects target the same managed cluster? | Project isolation on the agent side untested |
 | **No `syncPolicy.syncOptions` coverage** — `CreateNamespace`, `ServerSideApply`, `FailOnSharedResource` | Agent may behave differently than direct controller for these options |
+| **No PlacementDecision `score` workaround test** — OCM adds `score:0` (int64) to PlacementDecision; ArgoCD's DuckType generator panics on non-string values | ApplicationSet with `clusterDecisionResource` will crash in production without the manual PlacementDecision workaround |
+| **No cert rotation test** — `argocd-agent-client-tls` has 24-hour validity; OCM rotates at ~80% lifetime | Unknown whether agent survives cert rotation without disruption |
 
 ---
 
@@ -626,6 +668,94 @@ Both must be set — they are independent controls.
 
 ---
 
+### 2.4 — Policy Configuration & Prerequisites Tests
+
+#### TC-POLICY-01: Policy Customization Survives Controller Reconciliation
+
+| Field | Value |
+|-------|-------|
+| **Objective** | Verify that user-added Policy templates (RBAC, namespaces, Applications) are preserved when the GitOpsCluster controller reconciles |
+| **Pre-condition** | Agent mode enabled; Policy auto-generated by controller |
+| **Steps** | 1. Wait for the controller to generate the ArgoCD Policy<br>2. Patch the Policy to add a custom ConfigurationPolicy with a ClusterRoleBinding, a Namespace, and a view ClusterRoleBinding for the agent SA<br>3. Trigger a controller reconcile (e.g., update a GitOpsCluster annotation)<br>4. Wait for reconcile to complete<br>5. Verify all user-added templates are still present in the Policy<br>6. Verify only `argoCDAgent.agent.image` was potentially touched (if drift heal ran)<br>7. Verify the Policy is still Compliant on managed clusters |
+| **Expected** | All user customizations preserved; controller only touches agent image field |
+| **Result** | **NOT YET TESTED** |
+
+---
+
+#### TC-POLICY-02: Policy Deletion and Recreation
+
+| Field | Value |
+|-------|-------|
+| **Objective** | Verify the controller recreates a deleted Policy, and that `skip-argocd-policy` annotation prevents recreation |
+| **Pre-condition** | Agent mode enabled; Policy exists and is Compliant |
+| **Steps** | 1. Delete the ArgoCD Policy<br>2. Wait for controller reconcile<br>3. Verify the Policy is recreated with the ArgoCD CR template<br>4. Re-add user customizations (RBAC, namespaces) to the recreated Policy<br>5. Verify Policy becomes Compliant again<br>6. Set `apps.open-cluster-management.io/skip-argocd-policy: "true"` annotation on GitOpsCluster<br>7. Delete the Policy again<br>8. Wait for controller reconcile<br>9. Verify the Policy is NOT recreated<br>10. Verify `ArgoCDPolicyReady` condition shows `Reason=Skipped` |
+| **Expected** | Without annotation: Policy recreated. With annotation: Policy stays deleted, condition shows Skipped |
+| **Result** | **NOT YET TESTED** |
+
+---
+
+#### TC-POLICY-03: Missing Prerequisites — Clear Error Reporting
+
+| Field | Value |
+|-------|-------|
+| **Objective** | Verify that missing each critical prerequisite produces a clear, actionable error rather than a silent failure |
+| **Pre-condition** | Agent mode enabled |
+| **Steps** | Test each prerequisite independently:<br>1. **Missing `ManagedClusterSetBinding`:** Delete the binding in `openshift-gitops` — verify Placement selects zero clusters and GitOpsCluster status reports the issue<br>2. **Missing `default` AppProject wildcards:** Remove wildcard `sourceNamespaces` from the `default` AppProject — verify the principal does not propagate the project; verify agents log "project not found" and Application fails<br>3. **Missing `ARGOCD_CLUSTER_CONFIG_NAMESPACES`:** Remove `local-cluster` from the env var — verify agent/principal pods crash with "namespaces is forbidden"; verify pod logs contain the error<br>4. **Missing `view` ClusterRoleBinding** for agent SA — verify ArgoCD UI live manifest returns "Resource not found in cluster" (not a generic error)<br>5. **`destinationBasedMapping` mismatch:** Set `destinationBasedMapping: true` on principal but omit on agent — verify ArgoCD UI shows "Resource not found in cluster" and agent logs show unexpected key format error |
+| **Expected** | Each missing prerequisite produces a specific, identifiable error message — no silent failures |
+| **Result** | **NOT YET TESTED** |
+
+---
+
+#### TC-POLICY-04: Policy with Agent SA `view` ClusterRoleBinding for Live Manifest
+
+| Field | Value |
+|-------|-------|
+| **Objective** | Verify that adding a `view` ClusterRoleBinding for the ArgoCD agent SA to the Policy enables ArgoCD UI live manifest on managed clusters |
+| **Pre-condition** | Agent mode enabled; Application synced and healthy |
+| **Steps** | 1. Without the `view` binding — confirm ArgoCD UI live manifest fails ("Resource not found in cluster")<br>2. Add a `view` ClusterRoleBinding to the Policy as an object template:<br>`clusterrole: view`, `serviceaccount: openshift-gitops:acm-openshift-gitops-agent-agent`<br>3. Wait for Policy to become Compliant<br>4. Verify ArgoCD UI live manifest now works — resource tree and live state visible<br>5. Verify this works on both OCP and Kind managed clusters |
+| **Expected** | Live manifest fails without binding; works after adding it via Policy; no manual kubectl needed |
+| **Result** | **NOT YET TESTED** |
+
+---
+
+#### TC-POLICY-05: Policy with `destinationBasedMapping` Consistency
+
+| Field | Value |
+|-------|-------|
+| **Objective** | Verify that setting `destinationBasedMapping: true` on the agent's ArgoCD CR (in the Policy) makes ArgoCD UI live manifest work when the principal also uses `destinationBasedMapping` |
+| **Pre-condition** | Agent mode enabled; principal has `destinationBasedMapping: true` |
+| **Steps** | 1. Verify principal ArgoCD CR has `destinationBasedMapping: true`<br>2. Modify the Policy to add `spec.argoCDAgent.agent.client.destinationBasedMapping: true` to the ArgoCD CR object template<br>3. Wait for Policy to become Compliant on managed clusters<br>4. Deploy an Application and wait for sync<br>5. Verify ArgoCD UI live manifest works — no "Resource not found" or Redis key format errors<br>6. Check agent logs for absence of "unexpected key format" errors |
+| **Expected** | With matching `destinationBasedMapping`, UI live manifest works; Redis keys are consistent |
+| **Result** | **NOT YET TESTED** |
+
+---
+
+#### TC-POLICY-06: Cert Rotation Resilience
+
+| Field | Value |
+|-------|-------|
+| **Objective** | Verify the agent survives automatic cert rotation without manual intervention and without Application disruption |
+| **Pre-condition** | Agent mode enabled; Applications synced and healthy; `argocd-agent-client-tls` cert has 24-hour validity |
+| **Steps** | 1. Record current `argocd-agent-client-tls` cert data on managed cluster<br>2. Delete `argocd-agent-client-tls` secret on managed cluster to simulate rotation<br>3. Verify the `SecretReconciler` re-creates the secret within 120 seconds (from the source secret in `open-cluster-management-agent-addon`)<br>4. Verify agent pods are rolling-restarted (pod template annotation `apps.open-cluster-management.io/cert-rotated-at` updated)<br>5. Verify agent re-establishes mTLS connection to principal after restart<br>6. Verify existing Applications remain `Synced`/`Healthy` — no disruption<br>7. Verify hub status accurately reflects managed cluster state throughout |
+| **Expected** | Secret re-created; agent restarted; mTLS restored; Applications unaffected |
+| **Result** | **NOT YET TESTED** |
+
+---
+
+#### TC-POLICY-07: PlacementDecision `score` Workaround for ApplicationSet
+
+| Field | Value |
+|-------|-------|
+| **Objective** | Verify the workaround for the OCM PlacementDecision `score:0` (int64) field that causes ArgoCD's ApplicationSet `clusterDecisionResource` DuckType generator to panic |
+| **Pre-condition** | Agent mode enabled; Placement selecting 2+ clusters |
+| **Steps** | 1. Check auto-generated PlacementDecision — verify it contains `score:0` (int64 field)<br>2. Attempt to create ApplicationSet pointing to the auto-generated PlacementDecision label — verify it panics or errors<br>3. Create a manual PlacementDecision with a **different label** containing only `clusterName` and `reason` (no `score`)<br>4. Create ApplicationSet pointing to the manual PlacementDecision's label<br>5. Verify Applications are generated correctly — no panic<br>6. Add/remove clusters from the manual PlacementDecision — verify ApplicationSet updates correctly |
+| **Expected** | Auto-generated PlacementDecision causes panic; manual PlacementDecision (no `score`) works correctly |
+| **Result** | **NOT YET TESTED** |
+
+> **Note:** This is a known ArgoCD bug. The workaround (manual PlacementDecision with a different label) must be documented and tested because every production deployment using `clusterDecisionResource` will hit this.
+
+---
+
 ## 3. AppProject Test Recommendations
 
 The agent pull model introduces a unique enforcement boundary: AppProject definitions live on the hub (principal side), but reconciliation happens on the spoke (agent side). This makes AppProject enforcement through the agent a higher-risk area than in standard ArgoCD — a bug could mean the principal accepts an Application that the agent enforces differently, or vice versa. The following recommendations are ordered by risk to production users.
@@ -654,18 +784,25 @@ Lower priority. Most setups with cluster-admin RBAC rely on AppProject as the gu
 |----------|---------|-----------|
 | **P0 — Must have** | TC-PROJECT-04 | Multi-tenant isolation through the agent — highest risk for cross-project breach |
 | **P0 — Must have** | TC-PROJECT-01 | sourceRepos restriction — fundamental AppProject guardrail, enforcement boundary unclear in agent model |
+| **P0 — Must have** | TC-POLICY-03 | Missing prerequisites — verify clear errors for ManagedClusterSetBinding, AppProject wildcards, ARGOCD_CLUSTER_CONFIG_NAMESPACES, view binding, DBM mismatch |
+| **P0 — Must have** | TC-POLICY-07 | PlacementDecision `score` workaround — every production ApplicationSet with `clusterDecisionResource` will hit this |
 | **P0 — Must have** | TC-APPSET-03 | MatrixGenerator (ClusterDecision + Git) — the primary multi-cluster + multi-app pattern for agent pull model |
 | **P0 — Must have** | TC-APPSET-04 | Cluster disconnected — agent resilience, workload survival, reconnection re-sync |
 | **P0 — Must have** | TC-SYNC-07 | No-delete with ApplicationSet in any namespace — covers both deletion vectors (Git removal + Application removal via Placement) |
 | **P0 — Must have** | TC-SYNC-06 | Full "no delete via Git" test — combines `prune: false`, per-resource annotation, and AppProject `orphanedResources` |
 | **P0 — Must have** | TC-SYNC-01 | `prune: false` is the most common production pattern for safe GitOps |
+| **P1 — Should have** | TC-POLICY-01 | Policy customization survives controller reconcile — validates user-owned Policy contract |
+| **P1 — Should have** | TC-POLICY-02 | Policy deletion/recreation + skip-argocd-policy annotation |
+| **P1 — Should have** | TC-POLICY-04 | Agent SA `view` ClusterRoleBinding via Policy — enables ArgoCD UI live manifest |
+| **P1 — Should have** | TC-POLICY-05 | destinationBasedMapping consistency via Policy — prevents Redis key mismatch |
+| **P1 — Should have** | TC-POLICY-06 | Cert rotation resilience — 24h cert lifecycle, agent restart, no Application disruption |
 | **P1 — Should have** | TC-PROJECT-02 | Blocking Secrets via Git is a common security policy; validates partial sync failure handling |
 | **P1 — Should have** | TC-SYNC-04 | selfHeal: false is critical for teams that make manual cluster-side changes |
 | **P1 — Should have** | TC-SYNC-03 | Per-resource prune protection is a widely-used safety mechanism |
-| **P2 — Nice to have** | TC-PROJECT-03 | clusterResourceWhitelist enforcement — AppProject as guardrail for cluster-scoped resources |
 | **P1 — Should have** | TC-APPSET-01 | GitGenerator (directories) — common pattern for mono-repo GitOps |
 | **P1 — Should have** | TC-APPSET-06 | Cluster disconnected + removed from Placement — worst-case resilience scenario |
 | **P1 — Should have** | TC-APPSET-05 | Cluster OCP upgrade — agent continuity and version drift heal |
+| **P2 — Nice to have** | TC-PROJECT-03 | clusterResourceWhitelist enforcement — AppProject as guardrail for cluster-scoped resources |
 | **P2 — Nice to have** | TC-APPSET-02 | GitGenerator (files) — parameterized per-cluster config from Git |
 | **P2 — Nice to have** | TC-SYNC-02 | Manual-only sync |
 | **P2 — Nice to have** | TC-SYNC-05 | CreateNamespace sync option |
@@ -673,17 +810,24 @@ Lower priority. Most setups with cluster-admin RBAC rely on AppProject as the gu
 
 ---
 
-## 4. Summary
+## 5. Summary
 
-The current test plan validates the **happy path with wide-open AppProject and aggressive sync policies**. It proves the agent pull model works when:
+The current test plan validates the **happy path with wide-open AppProject, aggressive sync policies, and default Policy configuration**. It proves the agent pull model works when:
 - RBAC is `cluster-admin` (correct — companion policy always runs as cluster-admin)
 - AppProject is `default` (allow everything)
 - Sync policy is `automated + prune + selfHeal`
+- Policy uses the bare minimum auto-generated template
+- All prerequisites are correctly configured
 
-It does **not** validate configurations that production users commonly need:
+It does **not** validate:
+- **Policy lifecycle:** customization survival, deletion/recreation, `skip-argocd-policy` annotation
+- **Missing prerequisites:** silent failures when ManagedClusterSetBinding, AppProject wildcards, `ARGOCD_CLUSTER_CONFIG_NAMESPACES`, agent SA `view` binding, or `destinationBasedMapping` are misconfigured
+- **PlacementDecision `score` bug:** every `clusterDecisionResource` ApplicationSet hits this in production
+- **Cert rotation:** 24-hour cert lifecycle and agent restart behavior
 - Custom AppProjects restricting repos, namespaces, or resource kinds
 - `prune: false` (create/update only, never delete)
 - `selfHeal: false` (allow manual cluster changes)
-- Per-resource sync option overrides
+- ApplicationSet generators beyond `clusterDecisionResource` (GitGenerator, MatrixGenerator)
+- Cluster disconnection/reconnection and OCP upgrade resilience
 
-**Recommendation:** Prioritize TC-PROJECT-04 (multi-tenant isolation), TC-PROJECT-01 (sourceRepos), and TC-SYNC-01 (prune: false) as immediate additions. TC-PROJECT-04 and TC-PROJECT-01 target the agent-specific enforcement boundary where hub principal and spoke agent must agree — the highest-risk area unique to the pull model. TC-SYNC-01 covers the most common production sync policy divergence.
+**Recommendation:** Prioritize TC-POLICY-03 (missing prerequisites), TC-POLICY-07 (PlacementDecision workaround), TC-PROJECT-04 (multi-tenant isolation), and TC-SYNC-01 (prune: false) as immediate additions. TC-POLICY-03 and TC-POLICY-07 catch issues that every production deployment will encounter on first setup. TC-PROJECT-04 and TC-PROJECT-01 target the agent-specific enforcement boundary. TC-SYNC-01 covers the most common production sync policy.
