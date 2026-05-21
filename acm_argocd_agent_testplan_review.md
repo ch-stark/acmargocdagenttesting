@@ -237,6 +237,99 @@ syncPolicy:
 
 ---
 
+#### TC-SYNC-06: No-Delete GitOps — Create and Update Only (Combined Configuration)
+
+Since the companion policy always runs as `cluster-admin`, **RBAC is not the layer to restrict deletion**. Instead, "no delete" must be configured at the ArgoCD Application and AppProject level. There are three layers that can enforce this, and they can be combined for defense-in-depth:
+
+| Layer | Where to configure | What it controls |
+|-------|-------------------|-----------------|
+| **Application `syncPolicy`** | `syncPolicy.automated.prune: false` on the `Application` resource | Prevents ArgoCD from deleting resources when they are removed from the Git source |
+| **Per-resource annotation** | `argocd.argoproj.io/sync-options: Prune=false` on individual Kubernetes resources in Git | Protects specific resources from pruning even if the Application has `prune: true` |
+| **AppProject `orphanedResources`** | `spec.orphanedResources.warn: true` on the `AppProject` (without `ignore` patterns) | Warns about orphaned resources instead of allowing silent deletion; does not block prune but provides visibility |
+
+> **Key point:** `prune: false` on the Application is the primary control. The per-resource annotation is a safety net for critical resources. Neither changes the SA's RBAC — the agent still has `cluster-admin` permissions but ArgoCD's application layer will not issue delete calls.
+
+| Field | Value |
+|-------|-------|
+| **Objective** | Verify that a complete "no delete" configuration prevents any resource deletion via Git on the managed cluster through the agent, while still allowing create and update operations |
+| **Pre-condition** | Agent mode enabled; hub principal configured |
+| **Steps** | 1. Create AppProject `create-update-only` with `orphanedResources.warn: true`<br>2. Create Application referencing this project with `syncPolicy.automated.prune: false, selfHeal: true`<br>3. Git source contains: `Deployment`, `Service`, `ConfigMap` (annotated with `Prune=false`)<br>4. Wait for initial sync — verify all 3 resources created on managed cluster<br>5. **Test create:** Add a new `ConfigMap` (`config-extra`) to the Git source — verify it is created on managed cluster<br>6. **Test update:** Change the `Deployment` replica count in Git — verify it is updated on managed cluster<br>7. **Test no-delete (application-level):** Remove the `Service` from Git — verify it is NOT deleted from managed cluster; Application shows `OutOfSync`<br>8. **Test no-delete (annotation-level):** Temporarily set `prune: true` on the Application, then remove the annotated `ConfigMap` from Git — verify it is NOT deleted (annotation overrides)<br>9. **Test no-delete (manual sync with prune):** Run `argocd app sync --prune` manually — verify the `Service` (no annotation) IS pruned but the annotated `ConfigMap` is NOT<br>10. Verify hub accurately mirrors all states throughout |
+| **Expected** | Creates and updates succeed; automated deletion is blocked by `prune: false`; per-resource annotation provides additional protection; `orphanedResources.warn` logs warnings for out-of-sync resources |
+| **Result** | **NOT YET TESTED** |
+
+```yaml
+# 1. AppProject — enable orphaned resource warnings
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: create-update-only
+  namespace: openshift-gitops
+spec:
+  sourceRepos:
+    - "https://github.com/argoproj/argocd-example-apps"
+  destinations:
+    - namespace: "guestbook"
+      server: "*"
+  clusterResourceWhitelist: []
+  namespaceResourceWhitelist:
+    - group: ""
+      kind: "*"
+    - group: "apps"
+      kind: "*"
+  orphanedResources:
+    warn: true
+---
+# 2. Application — prune: false, selfHeal: true (create + update only)
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: guestbook-no-delete
+  namespace: openshift-gitops
+spec:
+  project: create-update-only
+  source:
+    repoURL: https://github.com/argoproj/argocd-example-apps
+    targetRevision: HEAD
+    path: guestbook
+  destination:
+    name: '{{name}}'
+    namespace: guestbook
+  syncPolicy:
+    automated:
+      prune: false       # <-- primary control: never auto-delete
+      selfHeal: true      # <-- still auto-correct drift (updates only)
+    syncOptions:
+      - CreateNamespace=true
+---
+# 3. Per-resource annotation (in the Git-managed manifests)
+# Add to any resource that must NEVER be deleted, even during manual prune:
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: critical-config
+  namespace: guestbook
+  annotations:
+    argocd.argoproj.io/sync-options: Prune=false   # <-- per-resource safety net
+data:
+  key: value
+```
+
+**Configuration summary for "no delete via Git":**
+
+```
+Where to set it:
+├── Application.spec.syncPolicy.automated.prune: false     ← REQUIRED (primary)
+├── Resource annotation: Prune=false                        ← RECOMMENDED for critical resources
+└── AppProject.spec.orphanedResources.warn: true            ← OPTIONAL (visibility)
+
+What it does NOT affect:
+├── RBAC (cluster-admin) — unchanged, agent can still delete if instructed
+├── Manual kubectl delete — still works, this only controls ArgoCD behavior
+└── ArgoCD UI/CLI manual prune — works unless resource has Prune=false annotation
+```
+
+---
+
 ### 2.3 — Principal `allowedNamespaces` Restriction Test
 
 #### TC-PRINCIPAL-01: Hub Principal with Restricted `allowedNamespaces`
@@ -279,6 +372,7 @@ Lower priority. Most setups with cluster-admin RBAC rely on AppProject as the gu
 |----------|---------|-----------|
 | **P0 — Must have** | TC-PROJECT-04 | Multi-tenant isolation through the agent — highest risk for cross-project breach |
 | **P0 — Must have** | TC-PROJECT-01 | sourceRepos restriction — fundamental AppProject guardrail, enforcement boundary unclear in agent model |
+| **P0 — Must have** | TC-SYNC-06 | Full "no delete via Git" test — combines `prune: false`, per-resource annotation, and AppProject `orphanedResources` |
 | **P0 — Must have** | TC-SYNC-01 | `prune: false` is the most common production pattern for safe GitOps |
 | **P1 — Should have** | TC-PROJECT-02 | Blocking Secrets via Git is a common security policy; validates partial sync failure handling |
 | **P1 — Should have** | TC-SYNC-04 | selfHeal: false is critical for teams that make manual cluster-side changes |
